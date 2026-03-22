@@ -7,11 +7,21 @@ Hardware:
 
 Public API
 ----------
-    trace1, trace2, ifl = generate_trace_pair(trace_len=10,
-                                               interference_level="random")
+    trace1, trace2, ifl = generate_trace_pair(trace_len=16, nop_prob=0.25)
 
     ifl = |cyc_T1_concurrent - cyc_T1_solo|
         + |cyc_T2_concurrent - cyc_T2_solo|
+
+Trace generation
+----------------
+Each trace is a sequence of exactly *trace_len* instructions drawn
+independently and uniformly at random:
+  - NOP              with probability nop_prob
+  - LDR Rx, [addr]   otherwise, where addr is sampled uniformly from all
+                     line-aligned addresses in a 4× L2-capacity address space
+
+IFL is a pure emergent property of whichever addresses happen to map to
+the same L2 sets, computed by running the cycle-accurate simulator.
 
 Concurrency model
 -----------------
@@ -30,24 +40,6 @@ PLRU convention (2-way)
     state = index of the LRU way (the next victim).
     On access/install of way W:  state ← 1 − W   (the other way is now LRU).
     On miss: victim = state.
-
-Interference mechanism (_build_conflict_block)
-----------------------------------------------
-With a 2-way L2, line A is evicted by Core 1 through the following
-cycle-accurate sequence (MISS=10 cy, HIT=1 cy):
-
-  cycle  0: C0 loads A (miss)      → L2[S]=[A,_], PLRU evict_next=1
-             C1 loads B (same S, miss) → L2[S]=[A,B], PLRU evict_next=0 (=A)
-  cycle 10: C0 loads E1 (miss, same L1 set as A)
-             C1 reloads B (hit)    → PLRU still evict_next=0 (A) ✓
-  cycle 11: C1 loads C (same S, miss) → L2 evicts A ✓
-  cycle 20: C0 loads E2 (miss, same L1 set as A) → L1 evicts A ✓
-  cycle 30: C0 reloads A → L1 miss + L2 miss → 10 cy  (concurrent)
-                         vs L1 miss + L2 hit  →  1 cy  (solo)
-
-Interference contribution per block = 10 − 1 = 9 cycles on T1.
-C1 naturally executes its reload-B and load-C during C0's stall on E1/E2,
-so no NOP padding is required (unlike the old round-robin model).
 """
 
 import random
@@ -136,11 +128,6 @@ class Cache:
 
 
 # ── address helpers ───────────────────────────────────────────────────────────
-def addr_for(set_idx: int, tag: int, num_sets: int = L2_SETS) -> int:
-    """Return a line-aligned byte address that maps to *set_idx* with *tag*."""
-    return (tag * num_sets + set_idx) * LINE_SIZE
-
-
 def _ldr(reg: int, addr: int) -> str:
     return f"LDR R{reg}, [0x{addr:04X}]"
 
@@ -192,7 +179,7 @@ def run_concurrent(trace1: list[str], trace2: list[str]) -> tuple[int, int]:
     The interleaving is resolved with a min-heap keyed on (next_free_cycle,
     core_id).  Ties (both cores free at the same cycle) are broken by core_id
     so that Core 0 always issues first when clocks are equal — this keeps the
-    simulation deterministic and consistent with the conflict-block design.
+    simulation deterministic.
 
     Cycle accounting
     ----------------
@@ -229,155 +216,133 @@ def run_concurrent(trace1: list[str], trace2: list[str]) -> tuple[int, int]:
     return finish[0], finish[1]
 
 
-# ── conflict block ────────────────────────────────────────────────────────────
-def _build_conflict_block(
-    l2_set: int,
-) -> tuple[list[Optional[int]], list[Optional[int]]]:
+# ── random trace generator ────────────────────────────────────────────────────
+# Address space: 4× the L2 capacity, rounded down to a line boundary.
+# This gives a realistic mix of L2 hits (re-accesses) and misses (cold lines),
+# and enough aliasing across L2 sets to produce natural cache interference.
+_ADDR_SPACE = (4 * L2_SIZE // LINE_SIZE) * LINE_SIZE   # 65 536 bytes
+_N_LINES    = _ADDR_SPACE // LINE_SIZE                  # 2 048 distinct lines
+
+
+def _l2_sets_of(trace: list[str]) -> list[int]:
+    """Return the list of L2 set indices accessed by *trace* (duplicates kept)."""
+    sets = []
+    for instr in trace:
+        addr = parse_ldr(instr)
+        if addr is not None:
+            sets.append((addr // LINE_SIZE) % L2_SETS)
+    return sets
+
+
+def _random_trace(
+    trace_len:     int,
+    nop_prob:      float,
+    conflict_sets: list[int] | None = None,
+    bias_prob:     float = 0.0,
+    reg_start:     int   = 0,
+) -> list[str]:
     """
-    Return a pair of raw address sequences (None = NOP) that produce 9 cycles
-    of interference on trace1 under cycle-accurate simulation.
+    Generate a single random trace of exactly *trace_len* instructions.
 
-    The sequences must be converted to LDR strings *in order* — do not
-    randomise their positions, as interference depends on the exact cycle
-    interleaving produced by the latencies below.
+    Each instruction slot is independently:
+      - NOP              with probability *nop_prob*
+      - LDR Rx, [addr]   otherwise, where addr is sampled as follows:
 
-    Cycle-accurate timeline (MISS=10 cy, HIT=1 cy)
-    ------------------------------------------------
-    C0 clock | C1 clock | event
-    ---------+----------+--------------------------------------------------
-       0     |    0     | C0 issues load A (miss, 10 cy)
-       0     |    0     | C1 issues load B (miss, 10 cy)  → L2[S]=[A,B], PLRU→evict A next
-      10     |   10     | C0 issues load E1 (miss, 10 cy)  [same L1 set as A]
-      10     |   10     | C1 issues reload B (hit, 1 cy)   → PLRU still points at A ✓
-      11     |          | C1 issues load C (miss, 10 cy)   [same L2 set S]
-                           → L2 PLRU evicts A from L2  ✓
-      20     |          | C0 issues load E2 (miss, 10 cy)  [same L1 set as A]
-                           → C0-L1 PLRU evicts A from L1  ✓
-      21     |          | C1 done
-      30     |          | C0 issues reload A
-                           → C0-L1 miss (A evicted) + L2 miss (A evicted) → 10 cy
-                           In solo: C0-L1 miss + L2 hit → 1 cy
-                           Interference on C0 = 10 − 1 = 9 cy  ✓
+        If *conflict_sets* is provided and non-empty, with probability
+        *bias_prob* the address is drawn from a line that maps to one of the
+        conflict sets (biased sampling); otherwise it is drawn uniformly from
+        all lines in _ADDR_SPACE (unbiased sampling).
 
-    The NOP padding required by the old round-robin model is no longer needed:
-    C1 naturally executes 'reload B' and 'load C' during C0's stall on E1/E2,
-    so the eviction happens at exactly the right moment without any padding.
+        Within a conflict set, the tag is chosen uniformly from the available
+        tags so that all lines in that set are equally likely.
 
-    Addresses
-    ---------
-    A, B, C  map to the same L2 set (l2_set), different tags → will conflict.
-    E1, E2   map to different L2 sets but the same L1 set as A → evict A
-             from L1 without disturbing L2[l2_set].
+    Parameters
+    ----------
+    conflict_sets : L2 set indices to bias towards (typically the sets accessed
+                    by the other trace in the pair).
+    bias_prob     : probability of drawing from conflict_sets on each LDR slot.
+                    0.0 = fully uniform (no bias); 1.0 = always conflict sets.
     """
-    A  = addr_for(l2_set, 0)
-    B  = addr_for(l2_set, 1)
-    C  = addr_for(l2_set, 2)
-    E1 = addr_for((l2_set +     L1_SETS) % L2_SETS, 0)   # same L1 set as A
-    E2 = addr_for((l2_set + 2 * L1_SETS) % L2_SETS, 0)   # same L1 set as A
+    instrs   = []
+    reg      = reg_start
+    n_tags   = _N_LINES // L2_SETS      # number of tags per L2 set
 
-    # 4 instructions each — no NOP padding needed
-    t1: list[Optional[int]] = [A,  E1, E2, A   ]
-    t2: list[Optional[int]] = [B,  B,  C,  None]
-    return t1, t2
-
-
-def _addrs_to_trace(addrs: list[Optional[int]], reg_start: int = 0) -> list[str]:
-    """Convert a raw address sequence (None = NOP, int = LDR) to instruction strings."""
-    instrs = []
-    reg = reg_start
-    for a in addrs:
-        if a is None:
+    for _ in range(trace_len):
+        if random.random() < nop_prob:
             instrs.append(NOP)
         else:
-            instrs.append(_ldr(reg % 8, a))
+            if conflict_sets and random.random() < bias_prob:
+                s    = random.choice(conflict_sets)
+                tag  = random.randrange(n_tags)
+                addr = (tag * L2_SETS + s) * LINE_SIZE
+            else:
+                addr = random.randrange(_N_LINES) * LINE_SIZE
+            instrs.append(_ldr(reg % 8, addr))
             reg += 1
+
     return instrs
 
 
-# ── main generator ────────────────────────────────────────────────────────────
 def generate_trace_pair(
-    trace_len: int = 10,
-    interference_level: str = "random",
+    trace_len: int   = 16,
+    nop_prob:  float = 0.25,
+    bias_prob: float = 0.5,
 ) -> tuple[list[str], list[str], int]:
     """
-    Generate a pair of instruction traces and return their interference level.
+    Generate a pair of random traces and return their interference level.
+
+    Trace 1 is generated uniformly at random.  Trace 2 is generated with a
+    bias towards the L2 sets that Trace 1 accesses: each LDR in Trace 2 is
+    drawn from one of those sets with probability *bias_prob*, and from the
+    full address space otherwise.
+
+    This shifts the IFL distribution away from the degenerate all-zeros case
+    without hard-coding any specific conflict pattern — IFL remains a pure
+    emergent output of the simulator.
 
     Parameters
     ----------
     trace_len : int
-        Approximate total instruction count per trace (including NOPs). Min 5.
-    interference_level : str
-        ``'low'``    – disjoint address spaces; ifl = 0.
-        ``'medium'`` – one conflict block; ifl = 9 cy.
-        ``'high'``   – 2–4 conflict blocks; ifl = n_blocks × 9 cy.
-        ``'random'`` – one of the above chosen randomly.
+        Exact number of instructions per trace.  Must be >= 1.
+    nop_prob  : float
+        Probability that any given instruction slot is a NOP (default 0.25).
+    bias_prob : float
+        Probability that each LDR in Trace 2 is drawn from a set already
+        accessed by Trace 1 (default 0.5).
+        0.0 → fully uniform, same as the unbiased generator.
+        1.0 → Trace 2 always targets Trace 1's sets (maximum conflict pressure).
 
     Returns
     -------
-    trace1 : list[str]
-    trace2 : list[str]
+    trace1 : list[str]   — exactly trace_len instructions, uniformly sampled
+    trace2 : list[str]   — exactly trace_len instructions, biased towards
+                           the L2 sets of trace1
     ifl    : int
-        Total cycle degradation: Σ |concurrent − solo| over both cores.
+        Total cycle degradation: |cyc_T1_concurrent - cyc_T1_solo|
+                                + |cyc_T2_concurrent - cyc_T2_solo|
     """
-    if interference_level == "random":
-        interference_level = random.choice(["low", "medium", "high"])
+    if not 0.0 <= nop_prob  <= 1.0:
+        raise ValueError(f"nop_prob must be in [0, 1], got {nop_prob}")
+    if not 0.0 <= bias_prob <= 1.0:
+        raise ValueError(f"bias_prob must be in [0, 1], got {bias_prob}")
+    trace_len = max(1, trace_len)
 
-    trace_len = max(5, trace_len)
+    # Generate T1 uniformly
+    trace1 = _random_trace(trace_len, nop_prob)
 
-    # ── build raw address lists ──────────────────────────────────────────────
-    if interference_level == "low":
-        # Disjoint L2 set pools → no structural conflict, ifl = 0.
-        half  = L2_SETS // 2
-        n_mem = trace_len * 3 // 4
-        pool0 = random.sample(range(0, half),       k=min(n_mem, half))
-        pool1 = random.sample(range(half, L2_SETS), k=min(n_mem, half))
-        t1_raw: list[Optional[int]] = \
-            [addr_for(pool0[i % len(pool0)], 0) for i in range(n_mem)] + \
-            [None] * (trace_len - n_mem)
-        t2_raw: list[Optional[int]] = \
-            [addr_for(pool1[i % len(pool1)], 0) for i in range(n_mem)] + \
-            [None] * (trace_len - n_mem)
-        # Shuffle the NOP positions uniformly
-        random.shuffle(t1_raw)
-        random.shuffle(t2_raw)
+    # Extract L2 sets T1 accesses, then generate T2 biased towards them
+    conflict_sets = _l2_sets_of(trace1)
+    trace2 = _random_trace(trace_len, nop_prob,
+                           conflict_sets=conflict_sets, bias_prob=bias_prob)
 
-    elif interference_level == "medium":
-        # One conflict block + a few independent accesses appended after it.
-        s = random.randint(0, L2_SETS - 1)
-        c0_block, c1_block = _build_conflict_block(s)
-
-        used_sets = {s,
-                     (s +     L1_SETS) % L2_SETS,
-                     (s + 2 * L1_SETS) % L2_SETS}
-        priv0 = random.sample([x for x in range(L2_SETS // 2)
-                                if x not in used_sets], k=2)
-        priv1 = random.sample([x for x in range(L2_SETS // 2, L2_SETS)
-                                if x not in used_sets], k=2)
-
-        # Conflict block comes first (order must be preserved), extras appended
-        t1_raw = list(c0_block) + [addr_for(p, 0) for p in priv0]
-        t2_raw = list(c1_block) + [addr_for(p, 0) for p in priv1]
-
-    else:  # high
-        # 2–4 independent conflict blocks concatenated.
-        n_blocks = random.randint(2, 4)
-        all_sets = list(range(L2_SETS))
-        chosen   = random.sample(all_sets, k=n_blocks)
-        t1_raw, t2_raw = [], []
-        for s in chosen:
-            c0, c1 = _build_conflict_block(s)
-            t1_raw += list(c0)
-            t2_raw += list(c1)
-
-    # ── convert to instruction strings ───────────────────────────────────────
-    trace1 = _addrs_to_trace(t1_raw, reg_start=0)
-    trace2 = _addrs_to_trace(t2_raw, reg_start=0)
 
     return trace1, trace2
 
 
 # ── demo ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import collections
+
     print("=" * 72)
     print("Cache hierarchy")
     print(f"  L1 (private) : {L1_SIZE // 1024}KB, {WAYS}-way, "
@@ -385,24 +350,44 @@ if __name__ == "__main__":
     print(f"  L2 (shared)  : {L2_SIZE // 1024}KB, {WAYS}-way, "
           f"{LINE_SIZE}B lines, {L2_SETS} sets, PLRU")
     print(f"  Hit: {HIT_CYCLES} cy  |  Miss: {MISS_CYCLES} cy")
+    print(f"  Address space: {_ADDR_SPACE} bytes  ({_N_LINES} distinct lines)")
     print()
 
-    for level in ("low", "medium", "high"):
-        t1, t2, ifl = generate_trace_pair(trace_len=10, interference_level=level)
-        s0 = run_solo(t1)
-        s1 = run_solo(t2)
-        c0, c1 = run_concurrent(t1, t2)
-        print(f"[{level.upper():6s}]")
-        print(f"  trace1      = {t1}")
-        print(f"  trace2      = {t2}")
-        print(f"  Solo        : T1={s0:3d} cy   T2={s1:3d} cy")
-        print(f"  Concurrent  : T1={c0:3d} cy   T2={c1:3d} cy")
-        print(f"  IFL         = {ifl} cy   (ΔT1={c0 - s0:+d}  ΔT2={c1 - s1:+d})")
+    # Single example pair
+    t1, t2, ifl = generate_trace_pair(trace_len=16)
+    s0 = run_solo(t1);  s1 = run_solo(t2)
+    c0, c1 = run_concurrent(t1, t2)
+    print("Example pair (trace_len=16, bias_prob=0.5):")
+    print(f"  trace1     = {t1}")
+    print(f"  trace2     = {t2}")
+    print(f"  Solo       : T1={s0:3d} cy   T2={s1:3d} cy")
+    print(f"  Concurrent : T1={c0:3d} cy   T2={c1:3d} cy")
+    print(f"  IFL        = {ifl} cy  (ΔT1={c0-s0:+d}  ΔT2={c1-s1:+d})")
+    print()
+
+    # Compare IFL distributions across bias_prob values
+    N = 1000
+    print(f"IFL distribution over {N} pairs (trace_len=16):")
+    print(f"  {'IFL':>5}  ", end="")
+    bias_levels = [0.0, 0.25, 0.5, 0.75, 1.0]
+    for b in bias_levels:
+        print(f"  bias={b:.2f}", end="")
+    print()
+
+    # Collect all counts first
+    all_counts = {}
+    for b in bias_levels:
+        c: dict[int, int] = collections.Counter()
+        for _ in range(N):
+            _, _, v = generate_trace_pair(trace_len=16, bias_prob=b)
+            c[v] += 1
+        all_counts[b] = c
+
+    all_ifls = sorted({k for c in all_counts.values() for k in c})
+    for ifl_val in all_ifls:
+        print(f"  {ifl_val:>5}  ", end="")
+        for b in bias_levels:
+            pct = all_counts[b].get(ifl_val, 0) / N * 100
+            print(f"  {pct:>9.1f}%", end="")
         print()
 
-    print("-" * 72)
-    print("generate_trace_pair() — direct API call:")
-    t1, t2, ifl = generate_trace_pair()
-    print(f"  trace1 = {t1}")
-    print(f"  trace2 = {t2}")
-    print(f"  ifl    = {ifl}")
