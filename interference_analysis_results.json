@@ -1,0 +1,62 @@
+[
+  {
+    "trace1_name": "Memory_Copy_1",
+    "trace2_name": "Memory_Copy_2_Similar",
+    "cosine_similarity": 0.9997944235801697,
+    "cosine_distance": 0.00020557641983032227,
+    "euclidean_distance": 0.020281648263335228,
+    "manhattan_distance": 0.43552324175834656,
+    "interference_level": "HIGH",
+    "interference_description": "Likely to cause cache conflicts and resource contention",
+    "embedding1_norm": 1.0,
+    "embedding2_norm": 1.0
+  },
+  {
+    "trace1_name": "Memory_Copy_1",
+    "trace2_name": "Memory_Copy_2_Different",
+    "cosine_similarity": 0.999801516532898,
+    "cosine_distance": 0.00019848346710205078,
+    "euclidean_distance": 0.019925037398934364,
+    "manhattan_distance": 0.42442238330841064,
+    "interference_level": "HIGH",
+    "interference_description": "Likely to cause cache conflicts and resource contention",
+    "embedding1_norm": 1.0,
+    "embedding2_norm": 1.0
+  },
+  {
+    "trace1_name": "Memory_Copy",
+    "trace2_name": "Compute_Intensive",
+    "cosine_similarity": 0.9901545643806458,
+    "cosine_distance": 0.009845435619354248,
+    "euclidean_distance": 0.14032472670078278,
+    "manhattan_distance": 2.746089458465576,
+    "interference_level": "HIGH",
+    "interference_description": "Likely to cause cache conflicts and resource contention",
+    "embedding1_norm": 1.0,
+    "embedding2_norm": 0.9999999403953552
+  },
+  {
+    "trace1_name": "Memory_Copy",
+    "trace2_name": "Stack_Intensive",
+    "cosine_similarity": 0.9916551113128662,
+    "cosine_distance": 0.008344888687133789,
+    "euclidean_distance": 0.12918967008590698,
+    "manhattan_distance": 2.620392322540283,
+    "interference_level": "HIGH",
+    "interference_description": "Likely to cause cache conflicts and resource contention",
+    "embedding1_norm": 1.0,
+    "embedding2_norm": 0.9999999403953552
+  },
+  {
+    "trace1_name": "Compute_Intensive",
+    "trace2_name": "Stack_Intensive",
+    "cosine_similarity": 0.9929792881011963,
+    "cosine_distance": 0.007020711898803711,
+    "euclidean_distance": 0.11849750578403473,
+    "manhattan_distance": 2.4878454208374023,
+    "interference_level": "HIGH",
+    "interference_description": "Likely to cause cache conflicts and resource contention",
+    "embedding1_norm": 0.9999999403953552,
+    "embedding2_norm": 0.9999999403953552
+  }
+]
