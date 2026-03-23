@@ -1,7 +1,10 @@
 # Load the trained embedder and apply it to new traces
 from ifs import TraceEmbedder, generate_trace_pair
 import torch
-
+import numpy as np
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
 import random
 
 all_traces = []
@@ -132,6 +135,54 @@ print(f"  Medium Similarity (>= {medium_similarity_threshold:.2f} and < {high_si
 print(f"  Low Similarity (< {medium_similarity_threshold:.2f}): {low_sim_count} pairs")
 
 print("\n✓ Analysis complete.")
+
+# Visualize embedding distributions and global structure
+
+def visualize_embedding_distribution(embeddings, title_prefix='Trace Embeddings'):
+    # embeddings: torch.Tensor shape (N, D)
+    embeddings_np = embeddings.detach().cpu().numpy() if hasattr(embeddings, 'detach') else np.array(embeddings)
+
+    # Flattened value distribution
+    plt.figure(figsize=(10, 4))
+    plt.hist(embeddings_np.flatten(), bins=120, color='mediumseagreen', alpha=0.75)
+    plt.title(f'{title_prefix} - Component Value Distribution (flattened)')
+    plt.xlabel('Embedding component value')
+    plt.ylabel('Count')
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Per-dimension mean and std
+    per_dim_mean = embeddings_np.mean(axis=0)
+    per_dim_std = embeddings_np.std(axis=0)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(per_dim_mean, color='navy', linewidth=1.0, label='Mean')
+    plt.fill_between(range(len(per_dim_std)), per_dim_mean - per_dim_std, per_dim_mean + per_dim_std, color='lightblue', alpha=0.4, label='Mean ± Std')
+    plt.title(f'{title_prefix} - Per-Dimension Mean ± Std')
+    plt.xlabel('Embedding dimension')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # PCA 2D projection
+    pca = PCA(n_components=2)
+    projected = pca.fit_transform(embeddings_np)
+    explained = pca.explained_variance_ratio_
+
+    plt.figure(figsize=(7, 6))
+    sc = plt.scatter(projected[:, 0], projected[:, 1], c=np.arange(projected.shape[0]), cmap='viridis', s=40, edgecolor='k', alpha=0.75)
+    plt.colorbar(sc, label='Trace index')
+    plt.title(f'{title_prefix} - PCA 2D projection (PC1 {explained[0]*100:.1f}%, PC2 {explained[1]*100:.1f}%)')
+    plt.xlabel('PC 1')
+    plt.ylabel('PC 2')
+    plt.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.show()
+
+visualize_embedding_distribution(all_embeddings, title_prefix='ARM Trace Embeddings')
+
 
 import seaborn as sns
 import matplotlib.pyplot as plt
