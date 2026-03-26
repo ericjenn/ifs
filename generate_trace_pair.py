@@ -339,6 +339,81 @@ def generate_trace_pair(
     return trace1, trace2
 
 
+# ── probe pool ───────────────────────────────────────────────────────────────
+
+def generate_probe_pool(
+    n_probes:  int   = 32,
+    trace_len: int   = 16,
+    nop_prob:  float = 0.25,
+    seed:      int   = 42,
+) -> list[list[str]]:
+    """
+    Generate a fixed pool of diverse reference traces to serve as canonical
+    probes for the metric-learning training scheme.
+
+    Each probe is drawn fully uniformly at random (bias_prob=0.0) so that
+    the pool covers the address space evenly without favouring any particular
+    L2 set.  A fixed *seed* guarantees the same pool is reproduced across
+    all training runs, which is essential: the embedding of a query trace
+    is only comparable to another query's embedding if both were measured
+    against the *same* probe set.
+
+    The probes are spread across four register banks (reg_start = i*8) so
+    that no two probes share destination registers, avoiding artefacts from
+    register-name collisions in the tokenizer.
+
+    Parameters
+    ----------
+    n_probes  : number of probe traces in the pool (default 32).
+    trace_len : length of each probe trace, should match query trace length.
+    nop_prob  : NOP probability for probe generation (matches query traces).
+    seed      : RNG seed for reproducibility.
+
+    Returns
+    -------
+    List of n_probes trace strings, each of exactly trace_len instructions.
+    """
+    state = random.getstate()
+    random.seed(seed)
+    probes = [
+        _random_trace(trace_len, nop_prob, reg_start=(i % 32) * 8)
+        for i in range(n_probes)
+    ]
+    random.setstate(state)
+    return probes
+
+
+def compute_degradation_profile(
+    query_trace: list[str],
+    probes:      list[list[str]],
+) -> list[float]:
+    """
+    Run *query_trace* concurrently against every probe and return the
+    per-probe cycle degradation of the query.
+
+    degradation[i] = cyc_query_concurrent_with_probe[i] - cyc_query_solo
+
+    This vector is the training target for the metric-learning scheme: two
+    queries with similar degradation profiles will be pulled together in
+    embedding space, making cosine similarity between embeddings a principled
+    proxy for interference susceptibility similarity.
+
+    Parameters
+    ----------
+    query_trace : list of assembly instruction strings.
+    probes      : probe pool returned by generate_probe_pool().
+
+    Returns
+    -------
+    List of floats of length len(probes), each >= 0.
+    """
+    solo = run_solo(query_trace)
+    return [
+        float(max(0, run_concurrent(query_trace, probe)[0] - solo))
+        for probe in probes
+    ]
+
+
 # ── demo ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import collections
